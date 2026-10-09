@@ -44,9 +44,10 @@ func TestOccurrenceWeights(t *testing.T) {
 				return e.w
 			}
 		}
+		t.Fatalf("missing link %s→%s", from, to)
 		return 0
 	}
-	if w("a", "b") != 2 || w("b", "a") != 2 || w("a", "c") != 1 {
+	if math.Abs(w("a", "b")-math.Log(2)) > 1e-9 || math.Abs(w("b", "a")-math.Log(2)) > 1e-9 || w("a", "c") != 0 {
 		t.Fatalf("weights a→b=%v b→a=%v a→c=%v", w("a", "b"), w("b", "a"), w("a", "c"))
 	}
 	if g.heavy <= w("a", "b") {

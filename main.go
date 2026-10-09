@@ -5,8 +5,8 @@
 // Command prlang builds a weighted word graph, ranks it, and walks it.
 //
 // Words from the corpus are nodes. A word points at the words that follow
-// it, and that link weighs how often the pair occurs. The prompt is a path
-// of extra nodes tied to those words with heavy links, and PageRank's
+// it, and that link weighs the log of how often the pair occurs. The prompt
+// is a path of extra nodes tied to those words with heavy links, and PageRank's
 // teleport lands on the prompt words with the same heavy weight. The walk
 // starts on the prompt. From each node it steps to a neighbor with
 // probability proportional to the link weight times that neighbor's PageRank.
@@ -157,7 +157,8 @@ type graph struct {
 }
 
 // buildGraph links each word to the word that follows it. The weight is the
-// number of times that happens. Prompt words then form a path of new nodes:
+// natural log of how often that happens, so a very common follower does not
+// crowd out the rest. Prompt words then form a path of new nodes:
 // each points at the next prompt word with a chain weight, and at the same
 // word in the corpus with a heavy weight. personal[i] is the unnormalized
 // teleport weight of node i. Prompt words carry the heavy weight there too,
@@ -185,6 +186,11 @@ func buildGraph(tokens, prompt []string) graph {
 	}
 	for i := 0; i+1 < len(ids); i++ {
 		out[ids[i]][ids[i+1]]++
+	}
+	for _, links := range out {
+		for to, count := range links {
+			links[to] = math.Log(count)
+		}
 	}
 
 	corpusOf := make([]uint32, len(prompt))
