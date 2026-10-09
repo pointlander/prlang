@@ -4,11 +4,14 @@
 
 // Command prlang builds a weighted word graph, ranks it, and walks it.
 //
-// Words from the corpus are nodes. A word points at the words that follow
-// it, and that link weighs the log of how often the pair occurs. The prompt
-// is a path of extra nodes tied to those words with heavy links, and PageRank's
-// teleport lands on the prompt words with the same heavy weight. The walk
-// starts on the prompt. From each node it steps to a neighbor with
+// Words from the corpus are nodes. Case is kept, punctuation stays on the
+// word it touches, and a line break stays on the word too. Spaces between
+// words are not words. A word points at the words that follow it, and that
+// link weighs the log of how often the pair occurs. The prompt is a path of
+// extra nodes tied to those words with
+// heavy links, and PageRank's teleport lands on the prompt words with the
+// same heavy weight. The walk starts on the prompt. From each node it steps
+// to a neighbor with
 // probability proportional to the link weight times that neighbor's PageRank.
 //
 //	prlang -prompt "To be, or not to be" -n 80
@@ -71,7 +74,7 @@ func run(file, promptText string, n int, seed int64) error {
 
 	fmt.Fprintf(os.Stderr, "words=%d vocab=%d nodes=%d edges=%d prompt=%d heavy=%g iters=%d seed=%d\n",
 		len(tokens), g.corpus, len(g.label), g.edges, len(prompt), g.heavy, iters, seed)
-	fmt.Println(strings.Join(words, " "))
+	fmt.Println(joinWords(words))
 	return nil
 }
 
@@ -94,10 +97,12 @@ func stripGutenberg(s string) string {
 	return s
 }
 
-// tokenize lowercases text and splits it into words. Apostrophes and
-// hyphens stay inside a word when they join letters ("know'st", "'tis").
+// tokenize keeps case. Punctuation stays on the word it touches, so "be," is
+// one word. Spaces and tabs between words are separators, not words. A line
+// break is part of the word it ends: "\r\n" stays those two characters, and
+// a blank line is the word "\r\n".
 func tokenize(text string) []string {
-	runes := []rune(strings.ToLower(text))
+	runes := []rune(text)
 	out := make([]string, 0, len(runes)/5)
 	buf := make([]rune, 0, 16)
 	flush := func() {
@@ -108,34 +113,44 @@ func tokenize(text string) []string {
 		buf = buf[:0]
 	}
 	for i := 0; i < len(runes); i++ {
-		r := fold(runes[i])
-		if isWord(r) {
-			buf = append(buf, r)
+		r := runes[i]
+		if r == '\r' && i+1 < len(runes) && runes[i+1] == '\n' {
+			buf = append(buf, '\r', '\n')
+			i++
+			flush()
 			continue
 		}
-		if (r == '\'' || r == '-') && i+1 < len(runes) && isWord(fold(runes[i+1])) && (len(buf) > 0 || r == '\'') {
+		if r == '\n' || r == '\r' {
 			buf = append(buf, r)
+			flush()
 			continue
 		}
-		flush()
+		if unicode.IsSpace(r) {
+			flush()
+			continue
+		}
+		buf = append(buf, r)
 	}
 	flush()
 	return out
 }
 
-func fold(r rune) rune {
-	switch r {
-	case '’', '‘', 'ʼ':
-		return '\''
-	case '‐', '‑':
-		return '-'
-	default:
-		return r
+// joinWords puts a space between words. A word that already carries a line
+// break is not given another separator.
+func joinWords(words []string) string {
+	var b strings.Builder
+	for i, w := range words {
+		if i > 0 && !breakEdge(words[i-1], w) {
+			b.WriteByte(' ')
+		}
+		b.WriteString(w)
 	}
+	return b.String()
 }
 
-func isWord(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r)
+func breakEdge(prev, next string) bool {
+	return strings.HasSuffix(prev, "\n") || strings.HasSuffix(prev, "\r") ||
+		strings.HasPrefix(next, "\n") || strings.HasPrefix(next, "\r")
 }
 
 type edge struct {
@@ -317,36 +332,46 @@ func pageRank(adj [][]edge, personal []float64, damp, eps float64) ([]float64, i
 
 // walk starts at the first prompt node and emits the prompt words plus n
 // more. Stepping from a prompt node onto the same word in the corpus does
-// not write the word again. A node with no outgoing link restarts at a node
-// drawn from the PageRank distribution.
+// not write the word again. Each word that has been written is less likely
+// to be chosen again. A node with no outgoing link restarts at a node drawn
+// from the PageRank distribution, with that same penalty.
 func walk(rng *rand.Rand, g graph, rank []float64, n int) []string {
 	want := g.prompt + n
 	if want < 1 {
 		return nil
 	}
+	used := make(map[string]int)
 	words := make([]string, 0, want)
 	cur := g.start
 	words = append(words, g.label[cur])
+	used[g.label[cur]]++
 	for len(words) < want {
-		next := step(rng, g.adj[cur], rank)
+		next := step(rng, g.adj[cur], rank, g.label, used)
 		if cur >= g.start && next < g.start && g.label[next] == g.label[cur] {
 			cur = next
 			continue
 		}
 		cur = next
 		words = append(words, g.label[cur])
+		used[g.label[cur]]++
 	}
 	return words
 }
 
-func step(rng *rand.Rand, edges []edge, rank []float64) uint32 {
+// reusePenalty is 1 the first time a word can be chosen, then 1/2, 1/3, …
+// after each time it has been written.
+func reusePenalty(used map[string]int, word string) float64 {
+	return 1 / float64(1+used[word])
+}
+
+func step(rng *rand.Rand, edges []edge, rank []float64, labels []string, used map[string]int) uint32 {
 	if len(edges) == 0 {
-		return sampleRank(rng, rank)
+		return sampleRank(rng, rank, labels, used)
 	}
 	total := 0.0
 	score := make([]float64, len(edges))
 	for i, e := range edges {
-		s := e.w * rank[e.to]
+		s := e.w * rank[e.to] * reusePenalty(used, labels[e.to])
 		if s < 0 || math.IsNaN(s) {
 			s = 0
 		}
@@ -374,22 +399,23 @@ func step(rng *rand.Rand, edges []edge, rank []float64) uint32 {
 	return edges[len(edges)-1].to
 }
 
-func sampleRank(rng *rand.Rand, rank []float64) uint32 {
+func sampleRank(rng *rand.Rand, rank []float64, labels []string, used map[string]int) uint32 {
 	total := 0.0
-	for _, r := range rank {
-		if r > 0 {
-			total += r
+	score := make([]float64, len(rank))
+	for i, r := range rank {
+		if r <= 0 {
+			continue
 		}
+		score[i] = r * reusePenalty(used, labels[i])
+		total += score[i]
 	}
 	if total == 0 {
 		return 0
 	}
 	x := rng.Float64() * total
 	acc := 0.0
-	for i, r := range rank {
-		if r > 0 {
-			acc += r
-		}
+	for i, s := range score {
+		acc += s
 		if x < acc {
 			return uint32(i)
 		}

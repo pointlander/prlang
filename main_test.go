@@ -13,14 +13,27 @@ import (
 
 func TestTokenize(t *testing.T) {
 	got := tokenize("To be, or not to be")
-	want := []string{"to", "be", "or", "not", "to", "be"}
-	if strings.Join(got, " ") != strings.Join(want, " ") {
-		t.Fatalf("tokenize = %q", got)
+	want := []string{"To", "be,", "or", "not", "to", "be"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("tokenize = %#v", got)
 	}
 	got = tokenize("know’st o’er ’tis well-known")
-	want = []string{"know'st", "o'er", "'tis", "well-known"}
-	if strings.Join(got, " ") != strings.Join(want, " ") {
-		t.Fatalf("tokenize = %q", got)
+	want = []string{"know’st", "o’er", "’tis", "well-known"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("tokenize = %#v", got)
+	}
+	got = tokenize("A\r\na  b.")
+	want = []string{"A\r\n", "a", "b."}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("tokenize = %#v", got)
+	}
+	got = tokenize("end\r\n\r\nNext")
+	want = []string{"end\r\n", "\r\n", "Next"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("tokenize = %#v", got)
+	}
+	if joinWords(got) != "end\r\n\r\nNext" {
+		t.Fatalf("join = %q", joinWords(got))
 	}
 }
 
@@ -82,6 +95,26 @@ func TestPromptLinkedHeavy(t *testing.T) {
 	}
 }
 
+func TestReuseLowersProbability(t *testing.T) {
+	edges := []edge{{to: 0, w: 1}, {to: 1, w: 1}}
+	rank := []float64{1, 1}
+	labels := []string{"used", "fresh"}
+	used := map[string]int{"used": 3}
+	rng := rand.New(rand.NewSource(1))
+	fresh := 0
+	const n = 400
+	for range n {
+		if labels[step(rng, edges, rank, labels, used)] == "fresh" {
+			fresh++
+		}
+	}
+	// Weights are equal except the used word is at 1/4, so fresh is chosen
+	// with probability 0.8.
+	if fresh < int(0.7*n) || fresh > int(0.9*n) {
+		t.Fatalf("fresh picks %d/%d", fresh, n)
+	}
+}
+
 func TestPageRankBiasAndWalk(t *testing.T) {
 	g := buildGraph(tokenize(strings.Repeat("aa bb aa cc ", 40)), []string{"bb"})
 	rank, _ := pageRank(g.adj, g.personal, alpha, rankEps)
@@ -97,14 +130,14 @@ func TestPageRankBiasAndWalk(t *testing.T) {
 		t.Fatalf("prompt word bb rank %v should exceed cc rank %v", rank[bb], rank[cc])
 	}
 
-	text := strings.Repeat("alpha one two beta three four ", 30)
-	g = buildGraph(tokenize(text), []string{"alpha", "beta"})
+	text := strings.Repeat("alpha\r\nbeta three\r\n", 30)
+	g = buildGraph(tokenize(text), []string{"alpha\r\n", "beta"})
 	rank, _ = pageRank(g.adj, g.personal, alpha, rankEps)
 	rng := rand.New(rand.NewSource(1))
-	got := walk(rng, g, rank, 4)
-	want := []string{"alpha", "beta", "three", "four", "alpha", "one"}
-	if strings.Join(got, " ") != strings.Join(want, " ") {
-		t.Fatalf("walk = %q, want %q", got, want)
+	got := walk(rng, g, rank, 3)
+	want := []string{"alpha\r\n", "beta", "three\r\n", "alpha\r\n", "beta"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("walk = %#v, want %#v", got, want)
 	}
 }
 
