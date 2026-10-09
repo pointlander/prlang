@@ -1,0 +1,392 @@
+// Copyright 2026 The prlang Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// Command prlang builds a weighted word graph, ranks it, and walks it.
+//
+// Words from the corpus are nodes. A word points at the words that follow
+// it, and that link weighs how often the pair occurs. The prompt is a path
+// of extra nodes tied to those words with heavy links, and PageRank's
+// teleport lands on the prompt words with the same heavy weight. The walk
+// starts on the prompt. From each node it steps to a neighbor with
+// probability proportional to the link weight times that neighbor's PageRank.
+//
+//	prlang -prompt "To be, or not to be" -n 80
+package main
+
+import (
+	"flag"
+	"fmt"
+	"math"
+	"math/rand"
+	"os"
+	"sort"
+	"strings"
+	"unicode"
+)
+
+const (
+	// alpha is the PageRank damping factor.
+	alpha = 0.85
+	// rankEps is the L1 convergence tolerance for PageRank.
+	rankEps = 1e-8
+	// rankIters caps PageRank if it has not converged.
+	rankIters = 200
+)
+
+func main() {
+	file := flag.String("file", "pg100.txt", "corpus file")
+	promptFlag := flag.String("prompt", "To be, or not to be", "prompt linked into the graph")
+	n := flag.Int("n", 80, "words to generate after the prompt")
+	seed := flag.Int64("seed", 1, "random seed")
+	flag.Parse()
+
+	if err := run(*file, *promptFlag, *n, *seed); err != nil {
+		fmt.Fprintf(os.Stderr, "prlang: %s\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(file, promptText string, n int, seed int64) error {
+	if n < 0 {
+		return fmt.Errorf("-n must be >= 0")
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+	tokens := tokenize(stripGutenberg(string(data)))
+	prompt := tokenize(promptText)
+	if len(tokens) < 2 {
+		return fmt.Errorf("%s has fewer than 2 words", file)
+	}
+	if len(prompt) == 0 {
+		return fmt.Errorf("prompt has no words")
+	}
+
+	g := buildGraph(tokens, prompt)
+	ranks, iters := pageRank(g.adj, g.personal, alpha, rankEps)
+	rng := rand.New(rand.NewSource(seed))
+	words := walk(rng, g, ranks, n)
+
+	fmt.Fprintf(os.Stderr, "words=%d vocab=%d nodes=%d edges=%d prompt=%d heavy=%g iters=%d seed=%d\n",
+		len(tokens), g.corpus, len(g.label), g.edges, len(prompt), g.heavy, iters, seed)
+	fmt.Println(strings.Join(words, " "))
+	return nil
+}
+
+// stripGutenberg drops the Project Gutenberg header and footer when the
+// standard markers are present. Text without them is returned unchanged.
+func stripGutenberg(s string) string {
+	const start = "*** START OF THE PROJECT GUTENBERG EBOOK"
+	const end = "*** END OF THE PROJECT GUTENBERG EBOOK"
+	if i := strings.Index(s, start); i >= 0 {
+		rest := s[i+len(start):]
+		if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+			s = rest[nl+1:]
+		} else {
+			s = rest
+		}
+	}
+	if i := strings.Index(s, end); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
+
+// tokenize lowercases text and splits it into words. Apostrophes and
+// hyphens stay inside a word when they join letters ("know'st", "'tis").
+func tokenize(text string) []string {
+	runes := []rune(strings.ToLower(text))
+	out := make([]string, 0, len(runes)/5)
+	buf := make([]rune, 0, 16)
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		out = append(out, string(buf))
+		buf = buf[:0]
+	}
+	for i := 0; i < len(runes); i++ {
+		r := fold(runes[i])
+		if isWord(r) {
+			buf = append(buf, r)
+			continue
+		}
+		if (r == '\'' || r == '-') && i+1 < len(runes) && isWord(fold(runes[i+1])) && (len(buf) > 0 || r == '\'') {
+			buf = append(buf, r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return out
+}
+
+func fold(r rune) rune {
+	switch r {
+	case '’', '‘', 'ʼ':
+		return '\''
+	case '‐', '‑':
+		return '-'
+	default:
+		return r
+	}
+}
+
+func isWord(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+type edge struct {
+	to uint32
+	w  float64
+}
+
+// graph is the corpus word graph plus one path node per prompt word.
+type graph struct {
+	label    []string
+	adj      [][]edge
+	personal []float64
+	start    uint32
+	prompt   int
+	corpus   int
+	edges    int
+	heavy    float64
+	chain    float64
+}
+
+// buildGraph links each word to the word that follows it. The weight is the
+// number of times that happens. Prompt words then form a path of new nodes:
+// each points at the next prompt word with a chain weight, and at the same
+// word in the corpus with a heavy weight. personal[i] is the unnormalized
+// teleport weight of node i. Prompt words carry the heavy weight there too,
+// once per time they occur in the prompt.
+func buildGraph(tokens, prompt []string) graph {
+	index := make(map[string]uint32, 1024)
+	g := graph{prompt: len(prompt)}
+	intern := func(w string) uint32 {
+		if id, ok := index[w]; ok {
+			return id
+		}
+		id := uint32(len(g.label))
+		index[w] = id
+		g.label = append(g.label, w)
+		return id
+	}
+
+	ids := make([]uint32, len(tokens))
+	for i, w := range tokens {
+		ids[i] = intern(w)
+	}
+	out := make([]map[uint32]float64, len(g.label))
+	for i := range out {
+		out[i] = map[uint32]float64{}
+	}
+	for i := 0; i+1 < len(ids); i++ {
+		out[ids[i]][ids[i+1]]++
+	}
+
+	corpusOf := make([]uint32, len(prompt))
+	for i, w := range prompt {
+		corpusOf[i] = intern(w)
+		for len(out) < len(g.label) {
+			out = append(out, map[uint32]float64{})
+		}
+	}
+	g.corpus = len(g.label)
+
+	heavy := float64(len(tokens))
+	// The forward prompt edge has to beat the side edge into a corpus word.
+	// A prompt word can hold a large share of PageRank while a path node holds
+	// about one teleport share, and that ratio is on the order of heavy.
+	chain := heavy * heavy * 1000
+	g.heavy = heavy
+	g.chain = chain
+	g.start = uint32(len(g.label))
+	for _, w := range prompt {
+		g.label = append(g.label, w)
+		out = append(out, map[uint32]float64{})
+	}
+	for i := range prompt {
+		from := g.start + uint32(i)
+		if i+1 < len(prompt) {
+			out[from][g.start+uint32(i+1)] = chain
+		}
+		out[from][corpusOf[i]] += heavy
+	}
+
+	g.personal = make([]float64, len(g.label))
+	for i := range g.personal {
+		g.personal[i] = 1
+	}
+	for _, id := range corpusOf {
+		g.personal[id] += heavy
+	}
+
+	g.adj = make([][]edge, len(out))
+	nEdges := 0
+	for from, links := range out {
+		edges := make([]edge, 0, len(links))
+		for to, w := range links {
+			edges = append(edges, edge{to: to, w: w})
+		}
+		sort.Slice(edges, func(i, j int) bool { return edges[i].to < edges[j].to })
+		g.adj[from] = edges
+		nEdges += len(edges)
+	}
+	g.edges = nEdges
+	return g
+}
+
+// pageRank computes weighted personalized PageRank. personal is an
+// unnormalized teleport weight per node. The returned vector sums to 1.
+// iters is the number of power iterations that ran.
+func pageRank(adj [][]edge, personal []float64, damp, eps float64) ([]float64, int) {
+	n := len(adj)
+	if n == 0 {
+		return nil, 0
+	}
+	outSum := make([]float64, n)
+	for i, edges := range adj {
+		for _, e := range edges {
+			outSum[i] += e.w
+		}
+	}
+	p := make([]float64, n)
+	psum := 0.0
+	for i := range p {
+		if personal != nil {
+			p[i] = personal[i]
+		} else {
+			p[i] = 1
+		}
+		if p[i] < 0 || math.IsNaN(p[i]) {
+			p[i] = 0
+		}
+		psum += p[i]
+	}
+	if psum == 0 {
+		for i := range p {
+			p[i] = 1 / float64(n)
+		}
+	} else {
+		for i := range p {
+			p[i] /= psum
+		}
+	}
+
+	rank := make([]float64, n)
+	next := make([]float64, n)
+	copy(rank, p)
+	iters := 0
+	for iters = 1; iters <= rankIters; iters++ {
+		for i := range next {
+			next[i] = 0
+		}
+		leak := 0.0
+		for i, edges := range adj {
+			if len(edges) == 0 || outSum[i] == 0 {
+				leak += rank[i]
+				continue
+			}
+			scale := damp * rank[i] / outSum[i]
+			for _, e := range edges {
+				next[e.to] += scale * e.w
+			}
+		}
+		base := (1 - damp) + damp*leak
+		delta := 0.0
+		for i := range next {
+			next[i] += base * p[i]
+			delta += math.Abs(next[i] - rank[i])
+		}
+		rank, next = next, rank
+		if delta < eps {
+			break
+		}
+	}
+	return rank, iters
+}
+
+// walk starts at the first prompt node and emits the prompt words plus n
+// more. Stepping from a prompt node onto the same word in the corpus does
+// not write the word again. A node with no outgoing link restarts at a node
+// drawn from the PageRank distribution.
+func walk(rng *rand.Rand, g graph, rank []float64, n int) []string {
+	want := g.prompt + n
+	if want < 1 {
+		return nil
+	}
+	words := make([]string, 0, want)
+	cur := g.start
+	words = append(words, g.label[cur])
+	for len(words) < want {
+		next := step(rng, g.adj[cur], rank)
+		if cur >= g.start && next < g.start && g.label[next] == g.label[cur] {
+			cur = next
+			continue
+		}
+		cur = next
+		words = append(words, g.label[cur])
+	}
+	return words
+}
+
+func step(rng *rand.Rand, edges []edge, rank []float64) uint32 {
+	if len(edges) == 0 {
+		return sampleRank(rng, rank)
+	}
+	total := 0.0
+	score := make([]float64, len(edges))
+	for i, e := range edges {
+		s := e.w * rank[e.to]
+		if s < 0 || math.IsNaN(s) {
+			s = 0
+		}
+		score[i] = s
+		total += s
+	}
+	if total == 0 {
+		total = 0
+		for i, e := range edges {
+			score[i] = e.w
+			total += e.w
+		}
+	}
+	if total == 0 {
+		return edges[len(edges)-1].to
+	}
+	x := rng.Float64() * total
+	acc := 0.0
+	for i, e := range edges {
+		acc += score[i]
+		if x < acc {
+			return e.to
+		}
+	}
+	return edges[len(edges)-1].to
+}
+
+func sampleRank(rng *rand.Rand, rank []float64) uint32 {
+	total := 0.0
+	for _, r := range rank {
+		if r > 0 {
+			total += r
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	x := rng.Float64() * total
+	acc := 0.0
+	for i, r := range rank {
+		if r > 0 {
+			acc += r
+		}
+		if x < acc {
+			return uint32(i)
+		}
+	}
+	return uint32(len(rank) - 1)
+}
