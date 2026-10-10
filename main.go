@@ -6,13 +6,15 @@
 //
 // Words from the corpus are nodes. Case is kept, punctuation stays on the
 // word it touches, and a line break stays on the word too. Spaces between
-// words are not words. A word points at the words that follow it, and that
-// link weighs the log of how often the pair occurs. The prompt is a path of
-// extra nodes tied to those words with
+// words are not words. A sentence of more than one word is also a word in
+// the graph: the words just before and at the end of it point at the
+// sentence, and the sentence points at the next word. A word points at the
+// words that follow it, and that link weighs the log of how often the pair
+// occurs. The prompt is a path of extra nodes tied to those words with
 // heavy links, and PageRank's teleport lands on the prompt words with the
 // same heavy weight. The walk starts on the prompt. From each node it steps
-// to a neighbor with
-// probability proportional to the link weight times that neighbor's PageRank.
+// to a neighbor with probability proportional to the link weight times that
+// neighbor's PageRank.
 //
 //	prlang -prompt "To be, or not to be" -n 80
 package main
@@ -72,8 +74,8 @@ func run(file, promptText string, n int, seed int64) error {
 	rng := rand.New(rand.NewSource(seed))
 	words := walk(rng, g, ranks, n)
 
-	fmt.Fprintf(os.Stderr, "words=%d vocab=%d nodes=%d edges=%d prompt=%d heavy=%g iters=%d seed=%d\n",
-		len(tokens), g.corpus, len(g.label), g.edges, len(prompt), g.heavy, iters, seed)
+	fmt.Fprintf(os.Stderr, "words=%d vocab=%d sentences=%d nodes=%d edges=%d prompt=%d heavy=%g iters=%d seed=%d\n",
+		len(tokens), g.corpus-g.sentences, g.sentences, len(g.label), g.edges, len(prompt), g.heavy, iters, seed)
 	fmt.Println(joinWords(words))
 	return nil
 }
@@ -153,6 +155,39 @@ func breakEdge(prev, next string) bool {
 		strings.HasPrefix(next, "\n") || strings.HasPrefix(next, "\r")
 }
 
+// sentenceEnd reports whether a word ends a sentence. A trailing line break
+// and closing quotes are ignored, so "died.\r\n" and "died." both end one.
+func sentenceEnd(word string) bool {
+	w := strings.TrimRight(word, "\r\n")
+	w = strings.TrimRight(w, "\"'”’")
+	rs := []rune(w)
+	if len(rs) == 0 {
+		return false
+	}
+	switch rs[len(rs)-1] {
+	case '.', '!', '?', '…':
+		return true
+	default:
+		return false
+	}
+}
+
+// sentenceSpans returns [start, end) token spans. A span runs from the
+// previous end through the word that finishes the sentence. A one-word
+// sentence is already a word and is not given another node.
+func sentenceSpans(tokens []string) [][2]int {
+	var spans [][2]int
+	start := 0
+	for i, w := range tokens {
+		if !sentenceEnd(w) {
+			continue
+		}
+		spans = append(spans, [2]int{start, i + 1})
+		start = i + 1
+	}
+	return spans
+}
+
 type edge struct {
 	to uint32
 	w  float64
@@ -160,20 +195,26 @@ type edge struct {
 
 // graph is the corpus word graph plus one path node per prompt word.
 type graph struct {
-	label    []string
-	adj      [][]edge
-	personal []float64
-	start    uint32
-	prompt   int
-	corpus   int
-	edges    int
-	heavy    float64
-	chain    float64
+	label     []string
+	adj       [][]edge
+	personal  []float64
+	start     uint32
+	prompt    int
+	corpus    int
+	sentences int
+	edges     int
+	heavy     float64
+	chain     float64
 }
 
 // buildGraph links each word to the word that follows it. The weight is the
 // natural log of how often that happens, so a very common follower does not
-// crowd out the rest. Prompt words then form a path of new nodes:
+// crowd out the rest. Each sentence of more than one word is added as a word
+// whose text is the sentence. The word before it and the word that ends it
+// point at that sentence, and the sentence points at the following word and
+// at the next sentence. Those links weigh the log of one plus how often they
+// occur, so a sentence seen once is still linked. Prompt words then form a
+// path of new nodes:
 // each points at the next prompt word with a chain weight, and at the same
 // word in the corpus with a heavy weight. personal[i] is the unnormalized
 // teleport weight of node i. Prompt words carry the heavy weight there too,
@@ -206,6 +247,51 @@ func buildGraph(tokens, prompt []string) graph {
 		for to, count := range links {
 			links[to] = math.Log(count)
 		}
+	}
+
+	grow := func() {
+		for len(out) < len(g.label) {
+			out = append(out, map[uint32]float64{})
+		}
+	}
+	type pair struct{ from, to uint32 }
+	sentCount := make(map[pair]float64)
+	linkSent := func(from, to uint32) {
+		if from == to {
+			return
+		}
+		sentCount[pair{from, to}]++
+	}
+	var prev uint32
+	havePrev := false
+	seenSent := make(map[uint32]struct{})
+	for _, sp := range sentenceSpans(tokens) {
+		if sp[1]-sp[0] < 2 {
+			prev = ids[sp[1]-1]
+			havePrev = true
+			continue
+		}
+		sid := intern(joinWords(tokens[sp[0]:sp[1]]))
+		grow()
+		if _, ok := seenSent[sid]; !ok {
+			seenSent[sid] = struct{}{}
+			g.sentences++
+		}
+		if sp[0] > 0 {
+			linkSent(ids[sp[0]-1], sid)
+		}
+		linkSent(ids[sp[1]-1], sid)
+		if sp[1] < len(ids) {
+			linkSent(sid, ids[sp[1]])
+		}
+		if havePrev && (sp[0] == 0 || prev != ids[sp[0]-1]) {
+			linkSent(prev, sid)
+		}
+		prev = sid
+		havePrev = true
+	}
+	for p, count := range sentCount {
+		out[p.from][p.to] += math.Log1p(count)
 	}
 
 	corpusOf := make([]uint32, len(prompt))

@@ -68,6 +68,40 @@ func TestOccurrenceWeights(t *testing.T) {
 	}
 }
 
+func TestSentencesAreWords(t *testing.T) {
+	g := buildGraph(tokenize("Go now. Stop. Go now."), []string{"Go"})
+	if g.sentences != 1 || g.corpus != 4 {
+		t.Fatalf("sentences=%d corpus=%d", g.sentences, g.corpus)
+	}
+	now, sent, stop := findCorpus(t, g, "now."), findCorpus(t, g, "Go now."), findCorpus(t, g, "Stop.")
+	w := func(from, to uint32) float64 {
+		for _, e := range g.adj[from] {
+			if e.to == to {
+				return e.w
+			}
+		}
+		t.Fatalf("missing link %d→%d", from, to)
+		return 0
+	}
+	if math.Abs(w(now, sent)-math.Log1p(2)) > 1e-9 {
+		t.Fatalf("now.→sentence = %v", w(now, sent))
+	}
+	if math.Abs(w(sent, stop)-math.Log1p(1)) > 1e-9 {
+		t.Fatalf("sentence→Stop. = %v", w(sent, stop))
+	}
+	if math.Abs(w(stop, sent)-math.Log1p(1)) > 1e-9 {
+		t.Fatalf("Stop.→sentence = %v", w(stop, sent))
+	}
+	// The word bigram is unchanged by the sentence link.
+	goID := findCorpus(t, g, "Go")
+	if math.Abs(w(goID, now)-math.Log(2)) > 1e-9 {
+		t.Fatalf("Go→now. = %v", w(goID, now))
+	}
+
+	line := buildGraph(tokenize("A\r\nman died.\r\nNext."), []string{"A\r\n"})
+	findCorpus(t, line, "A\r\nman died.\r\n")
+}
+
 func TestPromptLinkedHeavy(t *testing.T) {
 	text := strings.Repeat("alpha one two beta three four ", 30)
 	prompt := []string{"alpha", "beta"}
