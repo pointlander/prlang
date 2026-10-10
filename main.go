@@ -8,9 +8,12 @@
 // word it touches, and a line break stays on the word too. Spaces between
 // words are not words. A sentence of more than one word is also a word in
 // the graph: the words just before and at the end of it point at the
-// sentence, and the sentence points at the next word. A word points at the
-// words that follow it, and that link weighs the log of how often the pair
-// occurs. The prompt is a path of extra nodes tied to those words with
+// sentence, and the sentence points at the next word. From a word that
+// points at sentences, the walk gives those edges the same total chance as
+// the word edges. Taking a sentence writes it and continues from the word
+// after it. A word points at the words that follow it, and that link weighs
+// the log of how often the pair occurs. The prompt is a path of extra nodes
+// tied to those words with
 // heavy links, and PageRank's teleport lands on the prompt words with the
 // same heavy weight. The walk starts on the prompt. From each node it steps
 // to a neighbor with probability proportional to the link weight times that
@@ -203,6 +206,8 @@ type graph struct {
 	corpus    int
 	sentences int
 	edges     int
+	isSent    []bool
+	resume    []uint32 // word a sentence walk continues from
 	heavy     float64
 	chain     float64
 }
@@ -331,6 +336,27 @@ func buildGraph(tokens, prompt []string) graph {
 		g.personal[id] += heavy
 	}
 
+	g.isSent = make([]bool, len(g.label))
+	g.resume = make([]uint32, len(g.label))
+	for i := range g.resume {
+		g.resume[i] = uint32(i)
+	}
+	for sid := range seenSent {
+		g.isSent[sid] = true
+		best := sid
+		bestW := -1.0
+		for to, w := range out[sid] {
+			if _, ok := seenSent[to]; ok {
+				continue
+			}
+			if w > bestW {
+				bestW = w
+				best = to
+			}
+		}
+		g.resume[sid] = best
+	}
+
 	g.adj = make([][]edge, len(out))
 	nEdges := 0
 	for from, links := range out {
@@ -419,8 +445,9 @@ func pageRank(adj [][]edge, personal []float64, damp, eps float64) ([]float64, i
 // walk starts at the first prompt node and emits the prompt words plus n
 // more. Stepping from a prompt node onto the same word in the corpus does
 // not write the word again. Each word that has been written is less likely
-// to be chosen again. A node with no outgoing link restarts at a node drawn
-// from the PageRank distribution, with that same penalty.
+// to be chosen again. Choosing a sentence writes that sentence and continues
+// from the word after it. A node with no outgoing link restarts at a node
+// drawn from the PageRank distribution, with that same penalty.
 func walk(rng *rand.Rand, g graph, rank []float64, n int) []string {
 	want := g.prompt + n
 	if want < 1 {
@@ -432,9 +459,20 @@ func walk(rng *rand.Rand, g graph, rank []float64, n int) []string {
 	words = append(words, g.label[cur])
 	used[g.label[cur]]++
 	for len(words) < want {
-		next := step(rng, g.adj[cur], rank, g.label, used)
+		next := step(rng, g.adj[cur], rank, g.label, used, g.isSent, g.resume)
 		if cur >= g.start && next < g.start && g.label[next] == g.label[cur] {
 			cur = next
+			continue
+		}
+		if int(next) < len(g.isSent) && g.isSent[next] {
+			words = append(words, g.label[next])
+			used[g.label[next]]++
+			land := landAfter(rng, g, next, rank, used)
+			cur = land
+			if len(words) < want && land != next {
+				words = append(words, g.label[land])
+				used[g.label[land]]++
+			}
 			continue
 		}
 		cur = next
@@ -444,25 +482,84 @@ func walk(rng *rand.Rand, g graph, rank []float64, n int) []string {
 	return words
 }
 
+// landAfter samples the word edge that leaves a sentence. Sentence-to-sentence
+// edges stay in the graph for PageRank and are not where the walk resumes.
+func landAfter(rng *rand.Rand, g graph, sid uint32, rank []float64, used map[string]int) uint32 {
+	var edges []edge
+	for _, e := range g.adj[sid] {
+		if int(e.to) < len(g.isSent) && g.isSent[e.to] {
+			continue
+		}
+		edges = append(edges, e)
+	}
+	if len(edges) == 0 {
+		return g.resume[sid]
+	}
+	return step(rng, edges, rank, g.label, used, nil, nil)
+}
+
 // reusePenalty is 1 the first time a word can be chosen, then 1/2, 1/3, …
 // after each time it has been written.
 func reusePenalty(used map[string]int, word string) float64 {
 	return 1 / float64(1+used[word])
 }
 
-func step(rng *rand.Rand, edges []edge, rank []float64, labels []string, used map[string]int) uint32 {
+// neighborRank is the node's PageRank. A sentence uses the rank of the word
+// after it, so the edge is not crushed by the sentence node's own rank.
+func neighborRank(to uint32, rank []float64, isSent []bool, resume []uint32) float64 {
+	r := rank[to]
+	if isSent == nil || int(to) >= len(isSent) || !isSent[to] || resume == nil || int(to) >= len(resume) {
+		return r
+	}
+	rw := resume[to]
+	if int(rw) < len(rank) && rank[rw] > r {
+		return rank[rw]
+	}
+	return r
+}
+
+func step(rng *rand.Rand, edges []edge, rank []float64, labels []string, used map[string]int, isSent []bool, resume []uint32) uint32 {
 	if len(edges) == 0 {
 		return sampleRank(rng, rank, labels, used)
 	}
 	total := 0.0
+	sumSent := 0.0
+	maxSent := 0.0
 	score := make([]float64, len(edges))
+	sent := make([]bool, len(edges))
 	for i, e := range edges {
-		s := e.w * rank[e.to] * reusePenalty(used, labels[e.to])
+		s := e.w * neighborRank(e.to, rank, isSent, resume) * reusePenalty(used, labels[e.to])
 		if s < 0 || math.IsNaN(s) {
 			s = 0
 		}
 		score[i] = s
+		if isSent != nil && int(e.to) < len(isSent) && isSent[e.to] {
+			sent[i] = true
+			sumSent += s
+			if s > maxSent {
+				maxSent = s
+			}
+			continue
+		}
 		total += s
+	}
+	// Sentence edges share one chance equal to the word edges together, so a
+	// sentence can be chosen without the crowd of them drowning the walk.
+	// Word edges keep their weights relative to each other.
+	if sumSent > 0 {
+		target := total
+		if target == 0 {
+			target = maxSent
+		}
+		if target > 0 {
+			scale := target / sumSent
+			for i := range score {
+				if sent[i] {
+					score[i] *= scale
+					total += score[i]
+				}
+			}
+		}
 	}
 	if total == 0 {
 		total = 0

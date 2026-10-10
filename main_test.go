@@ -102,6 +102,21 @@ func TestSentencesAreWords(t *testing.T) {
 	findCorpus(t, line, "A\r\nman died.\r\n")
 }
 
+func TestWalkTakesSentence(t *testing.T) {
+	// "xx." follows "aa" once, so that word edge has log(1) = 0. The only
+	// positive edge is the sentence "aa xx.", which resumes at "bb."
+	g := buildGraph(tokenize("aa xx. bb."), []string{"xx."})
+	rank, _ := pageRank(g.adj, g.personal, alpha, rankEps)
+	got := walk(rand.New(rand.NewSource(1)), g, rank, 2)
+	want := []string{"xx.", "aa xx.", "bb."}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("walk = %#v, want %#v", got, want)
+	}
+	if g.resume[findCorpus(t, g, "aa xx.")] != findCorpus(t, g, "bb.") {
+		t.Fatalf("resume = %q", g.label[g.resume[findCorpus(t, g, "aa xx.")]])
+	}
+}
+
 func TestPromptLinkedHeavy(t *testing.T) {
 	text := strings.Repeat("alpha one two beta three four ", 30)
 	prompt := []string{"alpha", "beta"}
@@ -138,7 +153,7 @@ func TestReuseLowersProbability(t *testing.T) {
 	fresh := 0
 	const n = 400
 	for range n {
-		if labels[step(rng, edges, rank, labels, used)] == "fresh" {
+		if labels[step(rng, edges, rank, labels, used, nil, nil)] == "fresh" {
 			fresh++
 		}
 	}
