@@ -117,6 +117,25 @@ func TestWalkTakesSentence(t *testing.T) {
 	}
 }
 
+func TestSecondOrder(t *testing.T) {
+	text := strings.Repeat("aa xx one. ", 4) + strings.Repeat("bb xx two. ", 4)
+	next := func(prompt string) string {
+		g := buildGraph(tokenize(text), tokenize(prompt))
+		rank, _ := pageRank(g.adj, g.personal, alpha, rankEps)
+		got := walk(rand.New(rand.NewSource(1)), g, rank, 1)
+		if len(got) == 0 {
+			t.Fatalf("empty walk for %q", prompt)
+		}
+		return got[len(got)-1]
+	}
+	if got := next("aa xx"); got != "one." {
+		t.Fatalf("aa xx → %q", got)
+	}
+	if got := next("bb xx"); got != "two." {
+		t.Fatalf("bb xx → %q", got)
+	}
+}
+
 func TestPromptLinkedHeavy(t *testing.T) {
 	text := strings.Repeat("alpha one two beta three four ", 30)
 	prompt := []string{"alpha", "beta"}

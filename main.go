@@ -12,8 +12,10 @@
 // points at sentences, the walk gives those edges the same total chance as
 // the word edges. Taking a sentence writes it and continues from the word
 // after it. A word points at the words that follow it, and that link weighs
-// the log of how often the pair occurs. The prompt is a path of extra nodes
-// tied to those words with
+// the log of how often the pair occurs. A second-order link records which
+// word followed a pair, weighed by the log of one plus how often that
+// happened. The walk uses those links when the pair was seen. The prompt is
+// a path of extra nodes tied to those words with
 // heavy links, and PageRank's teleport lands on the prompt words with the
 // same heavy weight. The walk starts on the prompt. From each node it steps
 // to a neighbor with probability proportional to the link weight times that
@@ -77,8 +79,8 @@ func run(file, promptText string, n int, seed int64) error {
 	rng := rand.New(rand.NewSource(seed))
 	words := walk(rng, g, ranks, n)
 
-	fmt.Fprintf(os.Stderr, "words=%d vocab=%d sentences=%d nodes=%d edges=%d prompt=%d heavy=%g iters=%d seed=%d\n",
-		len(tokens), g.corpus-g.sentences, g.sentences, len(g.label), g.edges, len(prompt), g.heavy, iters, seed)
+	fmt.Fprintf(os.Stderr, "words=%d vocab=%d sentences=%d pairs=%d nodes=%d edges=%d prompt=%d heavy=%g iters=%d seed=%d\n",
+		len(tokens), g.corpus-g.sentences, g.sentences, g.pairs, len(g.label), g.edges, len(prompt), g.heavy, iters, seed)
 	fmt.Println(joinWords(words))
 	return nil
 }
@@ -205,9 +207,13 @@ type graph struct {
 	prompt    int
 	corpus    int
 	sentences int
+	pairs     int
+	pairStart int
 	edges     int
 	isSent    []bool
 	resume    []uint32 // word a sentence walk continues from
+	follow    []uint32 // corpus word a prompt or pair node stands for
+	bigram    map[[2]uint32]uint32
 	heavy     float64
 	chain     float64
 }
@@ -336,6 +342,11 @@ func buildGraph(tokens, prompt []string) graph {
 		g.personal[id] += heavy
 	}
 
+	out = addSecondOrder(&g, out, ids)
+	for i, id := range corpusOf {
+		g.follow[g.start+uint32(i)] = id
+	}
+
 	g.isSent = make([]bool, len(g.label))
 	g.resume = make([]uint32, len(g.label))
 	for i := range g.resume {
@@ -370,6 +381,46 @@ func buildGraph(tokens, prompt []string) graph {
 	}
 	g.edges = nEdges
 	return g
+}
+
+// addSecondOrder adds a node for every observed word pair. A pair points at
+// the pairs that followed it. The link weighs the log of one plus how often
+// that trigram occurred, so a continuation seen once is still available.
+func addSecondOrder(g *graph, out []map[uint32]float64, ids []uint32) []map[uint32]float64 {
+	g.pairStart = len(g.label)
+	g.bigram = make(map[[2]uint32]uint32)
+	type key struct{ from, to uint32 }
+	count := make(map[key]float64)
+	var prev uint32
+	have := false
+	for i := 0; i+1 < len(ids); i++ {
+		bk := [2]uint32{ids[i], ids[i+1]}
+		id, ok := g.bigram[bk]
+		if !ok {
+			id = uint32(len(g.label))
+			g.bigram[bk] = id
+			g.label = append(g.label, g.label[ids[i+1]])
+			out = append(out, map[uint32]float64{})
+			g.personal = append(g.personal, 0)
+		}
+		if have {
+			count[key{prev, id}]++
+		}
+		prev = id
+		have = true
+	}
+	for k, c := range count {
+		out[k.from][k.to] = math.Log1p(c)
+	}
+	g.pairs = len(g.bigram)
+	g.follow = make([]uint32, len(g.label))
+	for i := range g.follow {
+		g.follow[i] = uint32(i)
+	}
+	for bk, id := range g.bigram {
+		g.follow[id] = bk[1]
+	}
+	return out
 }
 
 // pageRank computes weighted personalized PageRank. personal is an
@@ -445,9 +496,11 @@ func pageRank(adj [][]edge, personal []float64, damp, eps float64) ([]float64, i
 // walk starts at the first prompt node and emits the prompt words plus n
 // more. Stepping from a prompt node onto the same word in the corpus does
 // not write the word again. Each word that has been written is less likely
-// to be chosen again. Choosing a sentence writes that sentence and continues
-// from the word after it. A node with no outgoing link restarts at a node
-// drawn from the PageRank distribution, with that same penalty.
+// to be chosen again. After two words, the next step follows the second-order
+// links of that pair when the pair was seen. Choosing a sentence writes that
+// sentence and continues from the word after it. A node with no outgoing
+// link restarts at a node drawn from the PageRank distribution, with that
+// same penalty.
 func walk(rng *rand.Rand, g graph, rank []float64, n int) []string {
 	want := g.prompt + n
 	if want < 1 {
@@ -456,30 +509,121 @@ func walk(rng *rand.Rand, g graph, rank []float64, n int) []string {
 	used := make(map[string]int)
 	words := make([]string, 0, want)
 	cur := g.start
+	var prev, curWord uint32
+	var havePrev, haveCur bool
+	note := func(id uint32) {
+		w, ok := anchor(g, id)
+		if !ok {
+			havePrev, haveCur = false, false
+			return
+		}
+		if haveCur {
+			prev = curWord
+			havePrev = true
+		} else {
+			havePrev = false
+		}
+		curWord = w
+		haveCur = true
+	}
 	words = append(words, g.label[cur])
 	used[g.label[cur]]++
+	note(cur)
+	choose := func(at uint32) uint32 {
+		if at < g.start && havePrev && haveCur {
+			if w, ok := anchor(g, at); ok && w == curWord {
+				if edges := orderEdges(g, prev, curWord); len(edges) > 0 {
+					return step(rng, edges, rank, g.label, used, g.isSent, g.resume)
+				}
+			}
+		}
+		return step(rng, g.adj[at], rank, g.label, used, g.isSent, g.resume)
+	}
 	for len(words) < want {
-		next := step(rng, g.adj[cur], rank, g.label, used, g.isSent, g.resume)
-		if cur >= g.start && next < g.start && g.label[next] == g.label[cur] {
+		next := choose(cur)
+		if isPrompt(g, cur) && next < g.start && g.label[next] == g.label[cur] {
 			cur = next
 			continue
 		}
 		if int(next) < len(g.isSent) && g.isSent[next] {
 			words = append(words, g.label[next])
 			used[g.label[next]]++
+			note(next)
 			land := landAfter(rng, g, next, rank, used)
 			cur = land
 			if len(words) < want && land != next {
 				words = append(words, g.label[land])
 				used[g.label[land]]++
+				note(land)
 			}
 			continue
 		}
 		cur = next
 		words = append(words, g.label[cur])
 		used[g.label[cur]]++
+		note(cur)
 	}
 	return words
+}
+
+func isPrompt(g graph, id uint32) bool {
+	return int(id) >= int(g.start) && int(id) < g.pairStart
+}
+
+// anchor is the corpus word a node stands for. Sentences are not words.
+func anchor(g graph, id uint32) (uint32, bool) {
+	if int(id) < len(g.isSent) && g.isSent[id] {
+		return 0, false
+	}
+	if int(id) >= int(g.start) {
+		if g.follow != nil && int(id) < len(g.follow) {
+			return g.follow[id], true
+		}
+		return 0, false
+	}
+	if int(id) < g.corpus {
+		return id, true
+	}
+	return 0, false
+}
+
+// orderEdges lists the words that followed the pair (prev, cur), plus any
+// sentence edges leaving cur. Nil means the pair was not seen.
+func orderEdges(g graph, prev, cur uint32) []edge {
+	if g.bigram == nil {
+		return nil
+	}
+	pid, ok := g.bigram[[2]uint32{prev, cur}]
+	if !ok || int(pid) >= len(g.adj) {
+		return nil
+	}
+	acc := make(map[uint32]float64)
+	add := func(to uint32, w float64) {
+		if w > 0 {
+			acc[to] += w
+		}
+	}
+	for _, e := range g.adj[pid] {
+		if g.follow != nil && int(e.to) < len(g.follow) {
+			add(g.follow[e.to], e.w)
+		}
+	}
+	if int(cur) < len(g.adj) {
+		for _, e := range g.adj[cur] {
+			if int(e.to) < len(g.isSent) && g.isSent[e.to] {
+				add(e.to, e.w)
+			}
+		}
+	}
+	if len(acc) == 0 {
+		return nil
+	}
+	edges := make([]edge, 0, len(acc))
+	for to, w := range acc {
+		edges = append(edges, edge{to: to, w: w})
+	}
+	sort.Slice(edges, func(i, j int) bool { return edges[i].to < edges[j].to })
+	return edges
 }
 
 // landAfter samples the word edge that leaves a sentence. Sentence-to-sentence
